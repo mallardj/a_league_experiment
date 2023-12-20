@@ -6,23 +6,60 @@ import win32gui
 import pytesseract
 import re
 import datetime
+import cassiopeia as cass
+from openai import OpenAI
+
+client = OpenAI()
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract'
 
 
-class LeagueChatEvent():
-    def __init__(self, minute, sec, mode, username, champname, msg):
-        self.time = datetime.time(minute=minute, second=sec)
-        self.mode = mode
-        self.username = username
-        self.champname = champname
-        self.msg = msg
+class LeagueChatEvent:
+    def __init__(self, game_time, mode, username, champ_name, msg):
+        champion_pool = cass.get_champions("NA")
+        if champ_name not in champion_pool:
+            return
+        minute, sec = game_time.split(":")
+        self.time = datetime.time(minute=int(minute), second=int(sec))
+        self.mode = mode if not (mode is None) else "[Team]"  # OneHotEncode
+        self.username = username  # Part of identifier. Do not encode.
+        self.champ_name = champ_name  # OneHotEncode
+        self.msg = msg  # Embed.
+        self.evaluation = self.consultOpenAI()
+
+    def consultOpenAI(self):
+        completion = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system",
+                 "content": "You perform sentiment analysis on chat dialogue from League of Legends. Where "
+                 "-1.0 signifies negative, and 1.0 signifies positive, return a number within [-1.0, 1.0]."
+                 "If it's a ping, subtract 0.1 from the total."},
+                {"role": "user", "content": self.msg}
+            ]
+        )
+        return sum([float(i.message.content) for i in completion.choices]) / len(completion.choices)
+
+    def __repr__(self):
+        return(f"""League Event:
+Time: {self.time.__repr__()}
+Mode: {self.mode}
+Champion: {self.champ_name}
+Message: {self.msg}
+Evaluation: {self.evaluation}
+""")
+
 
 
 def parse_output(out):
-    m = re.match(r"(\d+:\d+)\s*\[\w+]\s*\w+\s*\(\w+\):\s*.+", out)
-    parsed_tokens = m.group()
-    event = LeagueChatEvent(parsed_tokens)
+    regex = r"(?P<time>\d\d:\d\d)\s*(\[[\w ]+\])?\s*([\w ]+)\s*\(([a-zA-Z]+)\):?\s*(.+)"
+    ps = re.finditer(regex, out)
+    events = []
+    for p in ps:
+        parsed_tokens = [p.group(i) for i in range(1, 6)]
+        event = LeagueChatEvent(*parsed_tokens)
+        events.append(event)
+    return events
 
 
 def select_window(hwnd, extra):
@@ -39,38 +76,51 @@ def select_window(hwnd, extra):
             print("\t    Size: (%d, %d)" % (w, h))
         dims = (x + int(w * 15 / 16), y + int(h * 1 / 2), x + (w * 5 / 4), y + int(8 / 11 * h))
         camera_capture(dims)
+    else:
+        print("No LoL window detected.")
 
 
 def mask_relevant_colors(src, origsrc):
-    mask_white = cv2.inRange(src, (0, 0, 100), (0, 0, 93))
-    mask_red = cv2.inRange(src, (0, 80, 100), (0, 80, 93))
-    mask_green = cv2.inRange(src, (106.5, 31.3725, 100), (106.5, 31.3725, 93))
-    mask_grey = cv2.inRange(src, (0, 0, 82.3529), (0, 0, 75.3529))
-    mask_blue = cv2.inRange(src, (199.2265, 74.4856, 95.2941), (199.2265, 74.4856, 88.2941))
-    mask_orange = cv2.inRange(src,(38.8235, 100, 100), (38.8235, 100, 93) )
-    mask_cyan = cv2.inRange(src, (178.9655, 72.8033, 93.7255), (178.9655, 72.8033, 86))
-    masks = [mask_white, mask_red, mask_green, mask_grey, mask_blue, mask_orange, mask_cyan]
-    # results = [cv2.bitwise_and(src, src, mask=mask) for mask in masks]
-    summed = masks[0]
-    for i in masks[1:]:
-        summed += i
-    final_result = cv2.bitwise_and(origsrc, origsrc, mask=summed)
+    def convert_to_mask(x, value=None):
+        if value is None:
+            return cv2.inRange(src, (x[0] - 40, x[1] - 40, 100), (x[0] + 40, x[1] + 40, 255))
+        else:
+            return cv2.inRange(src, (x[0] - 40, x[1] - 40, value - 77), (x[0] + 40, x[1] + 40, 255))
+
+    mask_cyan = (179, 72)
+    mask_red = (0, 80)
+    mask_green = (106, 31)
+    mask_pink = (0, 14)
+    mask_blue = (194, 70, 80)
+    mask_orange = (38, 100, 130)
+    mask_white = (240, 0)
+    mask_white2 = (0, 0)
+
+    masks = [mask_white, mask_red, mask_green, mask_blue, mask_orange, mask_cyan, mask_pink, mask_white2]
+    results = [convert_to_mask(mask) if len(mask) == 2 else convert_to_mask(mask, mask[2]) for mask in masks]
+    final_result = cv2.bitwise_and(origsrc, origsrc, mask=sum(results))
+
+    print(f"Masked Image Shape: {final_result.shape}")
+    print(f"Masked Image Max Value: {np.max(final_result)}")
+    print(f"Masked Image Min Value: {np.min(final_result)}")
     return final_result
+
 
 def camera_capture(dims):
     while True:
-        time.sleep(3)  # captures every 5 seconds
+        time.sleep(3)  # captures every 3 seconds
         screen_dimensions = dims  # where is that chatbox?
         screen_pil = ImageGrab.grab(screen_dimensions)
         screen_np = np.array(screen_pil)
         screen_hsv = cv2.cvtColor(screen_np, cv2.COLOR_BGR2HSV)
         screen_np = cv2.cvtColor(screen_np, cv2.COLOR_BGR2RGB)
-        masked_screen_np = mask_relevant_colors(screen_hsv, screen_np)
-
+        # masked_screen_np = mask_relevant_colors(screen_hsv, screen_np)
+        screen_output = pytesseract.image_to_string(screen_np)
+        parse_output(screen_output)
         # convert ImageGrab -> CV2: https://stackoverflow.com/questions/32918978/convert-pil-image-to-opencv2-image
-        print(pytesseract.image_to_string(masked_screen_np))
+        print(pytesseract.image_to_string(screen_np))
 
-        cv2.imshow('window', masked_screen_np)
+        cv2.imshow('window', screen_np)
         if cv2.waitKey(25) & 0xFF == ord('~'):
             cv2.destroyAllWindows()
             break
